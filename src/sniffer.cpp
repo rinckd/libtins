@@ -82,6 +82,117 @@ bpf_u_int32 BaseSniffer::get_if_mask() const {
     return mask_;
 }
 
+struct bpf_insn rt_pgm_crop_data[] = {
+        // 00 LDB [3]      a = pkt[3] second half of length
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_ABS) + BPF_SIZE(BPF_B), 3),
+        // 01 LSH #8       a = a << 8
+        BPF_STMT(BPF_ALU + BPF_OP(BPF_LSH), 8),
+        // 02 TAX          x = a
+        BPF_STMT(BPF_MISC + BPF_MISCOP(BPF_TAX), 0),
+        // 03 LDB [2]      a = pkt[2] first half of length
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_ABS) + BPF_SIZE(BPF_B), 2),
+        // 04 ADD X         a = a + x  // combine endian swapped
+        BPF_STMT(BPF_ALU + BPF_OP(BPF_ADD) + BPF_SRC(BPF_X), 0),
+
+        // 05 ST M[0]      m[0] = a (rtap length)
+        BPF_STMT(BPF_ST, 0),
+        // 06 TAX          x = a = rtap length
+        BPF_STMT(BPF_MISC + BPF_MISCOP(BPF_TAX), 0),
+
+        // Fetch frame type
+
+        // 07 LDB [x + 0]  a = pkt[rtap + 0]
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_IND) + BPF_SIZE(BPF_B), 0),
+
+        // 08 AND #0xC     a & 0xC - extract type
+        BPF_STMT(BPF_ALU + BPF_OP(BPF_AND), 0xC),
+
+        // 09 JEQ #0x0    if == 0, accept as management frame
+        BPF_JUMP(BPF_JMP + BPF_JEQ, 0x0, 0, 1),
+        // 10 RET 0x40000  return success
+        BPF_STMT(BPF_RET, 0x40000),
+
+        // 11 JEQ #2       if a == 0x8, continue - process data frames (0x8 == b1000)
+        BPF_JUMP(BPF_JMP + BPF_JEQ, 0x8, 1, 0),
+        // 12 RET 0x0      reject all other frames
+        BPF_STMT(BPF_RET, 0),
+
+        // 13 LDB [x + 0]  a = pkt[rtap + 0] - re-load A with FC byte
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_IND) + BPF_SIZE(BPF_B), 0),
+        // 14 AND #0xF0    a = a & 0xF0 - isolate subtype
+        BPF_STMT(BPF_ALU + BPF_OP(BPF_AND), 0xF0),
+
+        // 15 JEQ #0       a == 0x0 (subtype normal data)
+        BPF_JUMP(BPF_JMP + BPF_JEQ, 0x0, 0, 2),
+        // 16 LD #24        a = 24 (non-qos header len)
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_IMM), 24),
+        // 17 JMP          jump past qos (22)
+        BPF_STMT(BPF_JMP + BPF_JA, 3),
+
+        // 18 JEQ #0x80    a == 0x80 (subtype qos data)
+        BPF_JUMP(BPF_JMP + BPF_JEQ, 0x80, 1, 0),
+        // 29 RET 0x0      reject, data subtype we don't care to process
+        BPF_STMT(BPF_RET, 0),
+
+        // 20 LD #26       a = 26 - set qos header len
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_IMM), 26),
+
+        // 21 ST M[1]      m[1] = a (offset length) -- Store length before checking protected flag
+        BPF_STMT(BPF_ST, 1),
+
+        // 22 LDB [ x + 1]  a = pkt[rtap + 1] (flags)
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_IND) + BPF_SIZE(BPF_B), 1),
+        // 23 JSET 0x40   if a & 0x40 set protected bit
+        BPF_JUMP(BPF_JMP + BPF_JSET, 0x40, 1, 0),
+
+        // 24 LD #0       a = 0
+        BPF_STMT(BPF_LD + BPF_SRC(BPF_K), 0),
+        // 25 ST M[2]     m[2] = a
+        BPF_STMT(BPF_ST, 2),
+
+        // 26 LDA m[1] .   a = m[1] (saved data offset length)
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_MEM), 1),
+        // 27 LDX M[0]     X = m[0] (rtap length)
+        BPF_STMT(BPF_LDX + BPF_MODE(BPF_MEM), 0),
+        // 28 ADD X        a = a + x
+        BPF_STMT(BPF_ALU + BPF_OP(BPF_ADD) + BPF_SRC(BPF_X), 0),
+        // 29 ST M[1]      m[1] = a (rtap length + offset length)
+        BPF_STMT(BPF_ST, 1),
+        // 30 TAX          x = a (x = total offset length)
+        BPF_STMT(BPF_MISC + BPF_MISCOP(BPF_TAX), 0),
+
+        // 31 LDA m[2] .   a = m[2] (saved flags)
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_MEM), 2),
+        // 32 JEQ #0 .     a == 0x0 - truncate if it's a protected frame
+        BPF_JUMP(BPF_JMP + BPF_JEQ, 0x0, 0, 6),
+
+        // 33 LDH [x + 0]  a = pkt[rtap + header + 0] - X hasn't been changed since we loaded it
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_IND) + BPF_SIZE(BPF_H), 0),
+        // 34 JEQ 0xAAAA   a == 0xAAAA (SNAP header) or truncate
+        BPF_JUMP(BPF_JMP + BPF_JEQ, 0xAAAA, 0, 4),
+
+        // 35 LDB [x + 6]  a = pkt[rtap + header + 6]
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_IND) + BPF_SIZE(BPF_B), 6),
+        // 36 JEQ 0x88   a == 0x88 eapol sig or truncate
+        BPF_JUMP(BPF_JMP + BPF_JEQ, 0x88, 0, 2),
+
+        // 37 LDB [x + 7]  a = pkt[rtap + header + 7]
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_IND) + BPF_SIZE(BPF_B), 7),
+        // 38 JEQ 0x8e   a == 0x8e eapol sig or truncate
+        BPF_JUMP(BPF_JMP + BPF_JEQ, 0x8E, 0, 2),
+
+        // truncate - m1 holds the total length of the headers+qos
+
+        // 39 LDB mem[1]
+        BPF_STMT(BPF_LD + BPF_MODE(BPF_MEM), 1),
+        // 40 RET a        Return a (limit packet length to rtap+dot11+qos?)
+        BPF_STMT(BPF_RET + BPF_RVAL(BPF_A), 0),
+
+        // 41 RET 0x0      return entire packet
+        BPF_STMT(BPF_RET, 0x40000),
+};
+unsigned int rt_pgm_crop_data_len = 42;
+
 struct sniff_data {
     struct timeval tv;
     PDU* pdu;
@@ -259,8 +370,13 @@ bool BaseSniffer::set_filter(const string& filter) {
     if (pcap_compile(handle_, &prog, filter.c_str(), 0, mask_) == -1) {
         return false;
     }
-    bool result = pcap_setfilter(handle_, &prog) != -1;
-    pcap_freecode(&prog);
+    
+    struct bpf_program bpf{};
+    bpf.bf_len = rt_pgm_crop_data_len;
+    bpf.bf_insns = rt_pgm_crop_data;
+    bool result = pcap_setfilter(handle_, &bpf) != -1;
+    //pcap_freecode(&prog);
+    std::cout << "filter applied" << std::endl;
     return result;
 }
 
