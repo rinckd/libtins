@@ -104,13 +104,14 @@ public:
     const Timestamp& timestamp() const {
         return ts_;
     }
-private:
+
     friend class BaseSniffer;
     friend class SnifferIterator;
     
     PacketWrapper(pdu_type pdu, const Timestamp& ts) 
     : pdu_(pdu), ts_(ts) {}
-    
+
+private:
     PacketWrapper(const PacketWrapper&);
     PacketWrapper& operator=(const PacketWrapper&);
     void* operator new (size_t size);
